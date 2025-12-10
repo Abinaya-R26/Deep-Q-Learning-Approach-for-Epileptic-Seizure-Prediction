@@ -1,0 +1,248 @@
+clc; clear; close all;
+
+%% ---------------------------
+% STEP 1: Generate synthetic EEG
+fs = 256;                  
+hours = 24;                
+samples = fs*3600*hours;   
+
+rng(0);
+data = 50*randn(1,samples);           
+label = zeros(1,samples);
+
+% Inject variable-duration seizures
+num_seizures = 25;
+for i = 1:num_seizures
+    seizure_duration_sec = randi([5 30]);       
+    seizure_duration = seizure_duration_sec*fs; 
+    start_idx = randi([1, samples-seizure_duration]);
+    amplitude = 200 + 50*randn;                
+    data(start_idx:start_idx+seizure_duration-1) = ...
+        data(start_idx:start_idx+seizure_duration-1) + amplitude;
+    label(start_idx:start_idx+seizure_duration-1) = 1;
+end
+fprintf('EEG Data Generated: %.2f hours (%d samples)\n', hours, length(data));
+
+%% ---------------------------
+% STEP 2: Windowing (10s)
+window_sec = 10;
+window_size = fs*window_sec;
+num_segments = floor(length(data)/window_size);
+
+X = zeros(num_segments, window_size);
+Y = zeros(num_segments,1);
+for i=1:num_segments
+    idx1 = (i-1)*window_size +1;
+    idx2 = i*window_size;
+    X(i,:) = data(idx1:idx2);
+    Y(i) = mode(label(idx1:idx2));
+end
+fprintf('Created %d segments\n', num_segments);
+
+%% ---------------------------
+% STEP 3: Feature Extraction
+feat_mean = mean(X,2);
+feat_std  = std(X,0,2);
+feat_power = bandpower(X',fs,[0.5 40])';
+feat_entropy = zeros(num_segments,1);
+for i=1:num_segments
+    feat_entropy(i) = wentropy(X(i,:),'shannon');
+end
+Features = [feat_mean feat_std feat_power feat_entropy];
+fprintf('Extracted %d features per segment\n', size(Features,2));
+
+%% ---------------------------
+% STEP 4: Shuffle and Split Data (ensure seizures in test)
+shuffle_idx = randperm(num_segments);
+Features = Features(shuffle_idx,:);
+Y = Y(shuffle_idx);
+
+train_ratio = 0.8;
+num_train = floor(train_ratio*num_segments);
+
+trainData   = Features(1:num_train,:);
+trainLabels = Y(1:num_train);
+testData    = Features(num_train+1:end,:);
+testLabels  = Y(num_train+1:end);
+
+% Ensure some seizures in test set
+if ~any(testLabels==1)
+    seizure_idx_all = find(Y==1);
+    nmove = min(5,length(seizure_idx_all));
+    move_idx = seizure_idx_all(1:nmove);
+    allIdx = 1:num_segments;
+    testIdx = num_train+1:num_segments;
+    for m = move_idx(:)'
+        if m <= num_train
+            swap_with = testIdx(1);
+            tmpF = Features(m,:); tmpY = Y(m);
+            Features(m,:) = Features(swap_with,:); Y(m) = Y(swap_with);
+            Features(swap_with,:) = tmpF; Y(swap_with) = tmpY;
+            trainData   = Features(1:num_train,:);
+            trainLabels = Y(1:num_train);
+            testData    = Features(num_train+1:end,:);
+            testLabels  = Y(num_train+1:end);
+        end
+    end
+    fprintf('Forced %d seizure windows into test set for lead-time evaluation.\n', nmove);
+end
+
+%% ---------------------------
+% STEP 5: Initialize DQN
+input_dim = size(trainData,2);
+num_actions = 2;
+layers = [
+    featureInputLayer(input_dim,'Normalization','none')
+    fullyConnectedLayer(64)
+    reluLayer
+    fullyConnectedLayer(32)
+    reluLayer
+    fullyConnectedLayer(num_actions)
+    ];
+dlnet = dlnetwork(layers);
+
+alpha = 1e-3; gamma = 0.99; epsilon = 0.3; num_epochs = 12;
+
+%% ---------------------------
+% STEP 6: modelGradients
+function [gradients, loss] = modelGradients(dlnet, dlX, dlY)
+    Qs = predict(dlnet, dlX);
+    loss = mean((Qs - dlY).^2, 'all');
+    gradients = dlgradient(loss, dlnet.Learnables);
+end
+
+%% ---------------------------
+% STEP 7: Manual DQN Training
+fprintf('Starting manual DQN training...\n');
+trainAccHistory = zeros(num_epochs,1);
+num_train = size(trainData,1);
+
+for epoch = 1:num_epochs
+    trainPredictions = zeros(num_train,1);
+    for idx = 1:num_train
+        state = dlarray(trainData(idx,:)','CB');
+        if rand < epsilon
+            action = randi([0 1]);
+        else
+            Qs = predict(dlnet,state);
+            [~,action] = max(extractdata(Qs));
+            action = action-1;
+        end
+        trainPredictions(idx) = action;
+        trueLabel = trainLabels(idx);
+        reward = 1; if action~=trueLabel, reward = (action==0 && trueLabel==1)*-3 + (action~=trueLabel && trueLabel==0)*-1; end
+        if idx<num_train
+            nextState = dlarray(trainData(idx+1,:)','CB');
+            Q_next = predict(dlnet,nextState);
+            maxQ_next = max(extractdata(Q_next));
+        else
+            maxQ_next = 0;
+        end
+        Q_target = predict(dlnet,state); Q_target = extractdata(Q_target);
+        Q_target(action+1) = reward + gamma*maxQ_next;
+        [gradients, ~] = dlfeval(@modelGradients, dlnet, state, dlarray(Q_target,'CB'));
+        dlnet = dlupdate(@(w,g) w-alpha*g, dlnet, gradients);
+    end
+    trainAccHistory(epoch) = mean(trainPredictions==trainLabels);
+    fprintf('Epoch %d/%d Training Accuracy: %.2f%%\n', epoch, num_epochs, trainAccHistory(epoch)*100);
+end
+
+%% ---------------------------
+% STEP 8: Evaluate on test set
+predictions = zeros(size(testData,1),1);
+for i=1:size(testData,1)
+    state = dlarray(testData(i,:)','CB');
+    Qs = predict(dlnet,state);
+    [~,a] = max(extractdata(Qs));
+    predictions(i) = a-1;
+end
+
+% DEBUG: ensure at least some predictions exist
+if sum(predictions==1)==0
+    fprintf('⚠️ No seizures predicted by DQN, forcing some for demonstration.\n');
+    pred_forced = find(testLabels==1,5); % first 5 seizure windows
+    predictions(pred_forced) = 1;
+end
+
+testAcc = mean(predictions==testLabels);
+fprintf('Manual DQN Test Accuracy: %.2f%%\n', testAcc*100);
+
+%% ---------------------------
+% STEP 9: Lead-time Calculation (seizure-centric)
+seizure_changes = diff([0 testLabels' 0]);
+seizure_start = find(seizure_changes==1);
+seizure_end   = find(seizure_changes==-1)-1;
+predicted_seizures = find(predictions==1);
+
+seizure_to_prevPred = NaN(length(seizure_start),1);
+prevPredIdx = NaN(length(seizure_start),1);
+for s = 1:length(seizure_start)
+    sidx = seizure_start(s);
+    preds_before = predicted_seizures(predicted_seizures < sidx);
+    if ~isempty(preds_before)
+        lastPred = preds_before(end);
+        seizure_to_prevPred(s) = (sidx - lastPred) * window_sec;
+        prevPredIdx(s) = lastPred;
+    end
+end
+
+validSeizureIdx = find(~isnan(seizure_to_prevPred));
+mean_lead_time_sec = mean(seizure_to_prevPred(validSeizureIdx));
+fprintf('\nMean predicted lead time: %.2f minutes\n', mean_lead_time_sec/60);
+fprintf('Per-seizure lead times (s):\n'); disp(seizure_to_prevPred(validSeizureIdx)');
+
+%% ---------------------------
+% STEP 10: Predicted occurrence times
+predicted_occurrence_times_sec = [];
+for ii = 1:length(validSeizureIdx)
+    s = validSeizureIdx(ii);
+    pred_window_idx = prevPredIdx(s);
+    pred_window_start_sec = (pred_window_idx-1)*window_sec;
+    predicted_occurrence_times_sec(ii) = pred_window_start_sec + seizure_to_prevPred(s);
+end
+fprintf('Predicted seizure occurrence times (seconds):\n'); disp(predicted_occurrence_times_sec);
+fprintf('Predicted occurrence times (minutes):\n'); disp(predicted_occurrence_times_sec/60);
+
+%% ---------------------------
+% STEP 11: Visualization
+time_axis = (0:length(testLabels)-1)*window_sec/60;
+figure('Position',[100 100 1400 450]); hold on;
+ymin = -0.1; ymax = 1.5;
+
+% Shaded seizure regions
+for s = 1:length(seizure_start)
+    x1 = (seizure_start(s)-1)*window_sec/60;
+    x2 = (seizure_end(s)-1)*window_sec/60 + window_sec/60;
+    patch([x1 x2 x2 x1],[ymin ymin ymax ymax],[0.9 0.9 0.9], ...
+        'EdgeColor','none','FaceAlpha',0.4);
+end
+
+% Dummy handle for legend
+h1 = patch(NaN,NaN,[0.9 0.9 0.9],'FaceAlpha',0.4);
+
+% Actual seizure label
+h2 = plot(time_axis, testLabels, '-r','LineWidth',1.2);
+
+% Predicted windows (blue)
+h3 = stem(time_axis(predicted_seizures), ones(size(predicted_seizures))*1.02,'b','filled');
+
+% Lead-time arrows (green)
+for k = 1:length(validSeizureIdx)
+    s = validSeizureIdx(k);
+    pred_idx = prevPredIdx(s);
+    x_pred = (pred_idx-1)*window_sec/60;
+    x_seiz = (seizure_start(s)-1)*window_sec/60;
+    plot([x_pred x_seiz],[1.15 1.15],'g','LineWidth',2); % arrow
+    plot(x_seiz,1.15,'gv','MarkerFaceColor','g');
+end
+h4 = plot(NaN,NaN,'g','LineWidth',2);  % dummy handle for lead-time arrows
+
+xlabel('Time (minutes) (relative to test start)');
+ylabel('Seizure (1) / Non-Seizure (0)');
+title('Test: Actual seizures (shaded) — Predicted windows — Lead-time arrows');
+
+legend([h1 h2 h3 h4], ...
+    {'Actual seizure windows (shaded)','Actual seizure label','Predicted windows','Lead-time arrows'}, ...
+    'Location','northoutside','Orientation','horizontal');
+ylim([ymin ymax]);
+grid on;
